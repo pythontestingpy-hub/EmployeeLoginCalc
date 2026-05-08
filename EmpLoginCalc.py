@@ -6,142 +6,124 @@ from datetime import datetime
 # Page Configuration
 st.set_page_config(page_title="Office Hours Analyser", layout="wide")
 
-# ─────────────────────────────────────────────────────────────
-# 1. PARSE MESSAGE TEXT
-# ─────────────────────────────────────────────────────────────
 def parse_message(msg: str) -> dict:
-    result = {"emp_name": None, "emp_id": None, "card_no": None, "direction": None}
-    if not isinstance(msg, str): return result
-
-    # Pattern: Admitted 'Name, ^123456^
-    m = re.search(r"'(.+?),\s*\^(\d+)\^", msg)
+    if not isinstance(msg, str): return {"emp_name": None, "emp_id": None, "direction": None}
+    result = {"emp_name": None, "emp_id": None, "direction": None}
+    # Regex to extract Name and ID from the Message Text column
+    m = re.search(r"(?:Admitted|Rejected)\s+'(.+?),\s*\^(\d{6,8})\^", msg)
     if m:
-        result["emp_name"] = m.group(1).strip()
-        result["emp_id"]   = m.group(2)
+        result["emp_name"], result["emp_id"] = m.group(1).strip(), m.group(2)
     
-    all_dirs = re.findall(r"\((\w+)\)", msg)
-    if all_dirs:
-        found_dir = all_dirs[-1].upper()
-        if "IN" in found_dir: result["direction"] = "IN"
-        elif "OUT" in found_dir: result["direction"] = "OUT"
-            
+    # Identify direction (IN/OUT)
+    all_dirs = re.findall(r"\((IN|OUT)\)", msg)
+    if all_dirs: result["direction"] = all_dirs[-1]
     return result
 
-# ─────────────────────────────────────────────────────────────
-# 2. DATA PROCESSING
-# ─────────────────────────────────────────────────────────────
 def load_data(uploaded_file) -> pd.DataFrame:
+    # Load Excel and clean column names
     df = pd.read_excel(uploaded_file, dtype=str)
     df.columns = df.columns.str.strip()
     
-    # Basic filters
-    df = df[df["Message"].str.strip().str.lower().str.contains("admitted", na=False)].copy()
-    df["timestamp"] = pd.to_datetime(df["Server Date/Time"], errors="coerce")
+    # UPDATED: Use 'Message Type' instead of 'Message'
+    # We use case-insensitive matching for 'card admitted'
+    msg_col = "Message Type" if "Message Type" in df.columns else "Message"
+    
+    df = df[df[msg_col].str.contains("admitted", case=False, na=False)].copy()
+    
+    # Convert timestamp and drop invalid dates (fixes the float comparison error)
+    df["timestamp"] = pd.to_datetime(df["Server Date/Time"], format="%d-%m-%y %H:%M", errors="coerce")
     df = df.dropna(subset=["timestamp"])
     
-    # Date helper columns
     df["date"] = df["timestamp"].dt.date
-    df["Month"] = df["timestamp"].dt.strftime('%B %Y') # e.g., "May 2026"
+    df["month_year"] = df["timestamp"].dt.strftime('%b %Y')
     
-    # Parse Message Text
+    # Parse the 'Message Text' column for employee details
     parsed = df["Message Text"].apply(parse_message).apply(pd.Series)
     df = pd.concat([df.reset_index(drop=True), parsed], axis=1)
     
-    if df["emp_id"].isnull().all():
-        st.warning("⚠️ Could not extract IDs. Check 'Message Text' format.")
-        st.stop()
+    return df.dropna(subset=["emp_id", "direction"]).sort_values("timestamp")
 
-    return df.dropna(subset=["emp_id", "direction"]).sort_values(["emp_id", "timestamp"])
-
-def compute_all_sessions(df):
-    """Computes durations for all rows to allow for monthly aggregation"""
-    sessions = []
-    for emp_id, group in df.groupby("emp_id"):
-        events = group[["timestamp", "direction", "Month"]].values.tolist()
-        i = 0
-        while i < len(events):
-            ts, direction, month = events[i]
-            if direction == "IN" and i + 1 < len(events) and events[i+1][1] == "OUT":
-                sessions.append({"emp_id": emp_id, "Month": month, "Duration": events[i+1][0] - ts})
+def compute_sessions(events):
+    sessions, i = [], 0
+    while i < len(events):
+        ts, direction = events[i]
+        if direction == "IN":
+            if i + 1 < len(events) and events[i+1][1] == "OUT":
+                sessions.append({"Login": ts, "Logout": events[i+1][0], "Duration": events[i+1][0] - ts})
                 i += 2
             else:
+                # IN without an OUT
+                sessions.append({"Login": ts, "Logout": None, "Duration": pd.Timedelta(0)})
                 i += 1
-    return pd.DataFrame(sessions)
+        else:
+            # OUT without an IN
+            sessions.append({"Login": None, "Logout": ts, "Duration": pd.Timedelta(0)})
+            i += 1
+    return sessions
 
 def fmt_dur(td):
-    if pd.isna(td): return "0h 00m"
-    total = int(td.total_seconds())
-    h, m = divmod(total // 60, 60)
+    if pd.isna(td) or td.total_seconds() <= 0: return "0h 00m"
+    total_secs = int(td.total_seconds())
+    h, m = divmod(total_secs // 60, 60)
     return f"{h}h {m:02d}m"
 
-# ─────────────────────────────────────────────────────────────
-# 3. INTERFACE
-# ─────────────────────────────────────────────────────────────
-st.title("🕒 Office Hours: Daily & Monthly Analyser")
+# --- STREAMLIT UI ---
+st.title("🕒 Employee Office Hours Analyser")
 
 with st.sidebar:
-    uploaded_file = st.file_uploader("Upload Company Log", type="xlsx")
-    search_val = st.text_input("Enter Employee ID or Name")
+    st.header("Setup")
+    uploaded_file = st.file_uploader("Upload Company Access Log (XLSX)", type="xlsx")
+    query_date = st.date_input("Select Date", datetime.now())
+    search_val = st.text_input("Enter Employee Name or ID")
 
 if uploaded_file and search_val:
-    data_df = load_data(uploaded_file)
+    df = load_data(uploaded_file)
     
-    # Logic to find the correct Employee ID
-    if search_val.isdigit():
-        target_id = search_val
-    else:
-        mask = data_df["emp_name"].str.contains(search_val, case=False, na=False)
-        target_id = data_df[mask]["emp_id"].iloc[0] if not data_df[mask].empty else None
+    # Match user input against ID or Name
+    mask = (df["emp_id"] == search_val) | (df["emp_name"].str.contains(search_val, case=False, na=False))
+    emp_df = df[mask]
 
-    if target_id:
-        emp_data = data_df[data_df["emp_id"] == target_id]
-        emp_name = emp_data["emp_name"].iloc[0]
+    if not emp_df.empty:
+        name = emp_df["emp_name"].iloc[0]
+        emp_id = emp_df["emp_id"].iloc[0]
+        st.subheader(f"Attendance Dashboard: {name} ({emp_id})")
+
+        # 1. Monthly Summary Logic
+        target_month = query_date.strftime('%b %Y')
+        month_df = emp_df[emp_df["month_year"] == target_month]
         
-        st.header(f"Employee: {emp_name} ({target_id})")
+        daily_summary = []
+        unique_dates = sorted(month_df["date"].unique())
+        total_month_seconds = 0
+        
+        for d in unique_dates:
+            day_events = month_df[month_df["date"] == d][["timestamp", "direction"]].values.tolist()
+            sessions = compute_sessions(day_events)
+            day_total = sum([s["Duration"] for s in sessions], pd.Timedelta(0))
+            total_month_seconds += day_total.total_seconds()
+            daily_summary.append({
+                "Date": d.strftime("%d-%m-%Y"), 
+                "Total Hours": fmt_dur(day_total)
+            })
 
-        # --- SECTION 1: MONTHLY SUMMARY ---
-        st.subheader("📊 Monthly Totals")
-        all_sessions = compute_all_sessions(emp_data)
-        if not all_sessions.empty:
-            # Group by Month and sum the timedeltas
-            monthly_summary = all_sessions.groupby("Month")["Duration"].sum().reset_index()
-            monthly_summary["Total Hours"] = monthly_summary["Duration"].apply(fmt_dur)
-            
-            # Display metrics side-by-side
-            cols = st.columns(len(monthly_summary))
-            for idx, row in monthly_summary.iterrows():
-                cols[idx].metric(row["Month"], row["Total Hours"])
+        # 2. Display Metrics (Daily vs Monthly)
+        col1, col2 = st.columns(2)
+        with col1:
+            day_str = query_date.strftime("%d-%m-%Y")
+            day_total_val = next((item["Total Hours"] for item in daily_summary if item["Date"] == day_str), "0h 00m")
+            st.metric(f"Hours on {query_date.strftime('%d %b')}", day_total_val)
+        with col2:
+            st.metric(f"Grand Total for {target_month}", fmt_dur(pd.Timedelta(seconds=total_month_seconds)))
+
+        # 3. Monthly Breakdown Table
+        st.write(f"### 🗓️ Daily Breakdown for {target_month}")
+        if daily_summary:
+            summary_df = pd.DataFrame(daily_summary)
+            st.table(summary_df)
+            st.write(f"**Total Monthly Hours Worked: {fmt_dur(pd.Timedelta(seconds=total_month_seconds))}**")
         else:
-            st.write("No complete sessions found to calculate monthly totals.")
-
-        st.divider()
-
-        # --- SECTION 2: DAILY BREAKDOWN ---
-        st.subheader("📅 Daily View")
-        available_dates = sorted(emp_data["date"].unique(), reverse=True)
-        selected_date = st.selectbox("Select a date to see detailed logs", available_dates)
-        
-        # (Session logic for the specific day)
-        day_events = emp_data[emp_data["date"] == selected_date][["timestamp", "direction"]].values.tolist()
-        day_sessions = []
-        i, day_total = 0, pd.Timedelta(0)
-        
-        while i < len(day_events):
-            ts, direction = day_events[i]
-            if direction == "IN" and i + 1 < len(day_events) and day_events[i+1][1] == "OUT":
-                dur = day_events[i+1][0] - ts
-                day_sessions.append({"In": ts.strftime("%H:%M"), "Out": day_events[i+1][0].strftime("%H:%M"), "Duration": fmt_dur(dur)})
-                day_total += dur
-                i += 2
-            else:
-                day_sessions.append({"In": ts.strftime("%H:%M") if direction == "IN" else "—", 
-                                     "Out": ts.strftime("%H:%M") if direction == "OUT" else "—", 
-                                     "Duration": "Incomplete"})
-                i += 1
-        
-        st.table(pd.DataFrame(day_sessions))
-        st.write(f"**Total for {selected_date}:** {fmt_dur(day_total)}")
+            st.info("No logs found for the selected month.")
     else:
-        st.error("Employee not found.")
+        st.error("Employee not found. Please check the Name/ID and try again.")
 else:
-    st.info("Upload a file to see the Monthly and Daily breakdown.")
+    st.info("Please upload the Excel file and enter an Employee Name or ID to see results.")
