@@ -6,7 +6,7 @@ from datetime import datetime
 # Page Configuration
 st.set_page_config(page_title="Office Hours Analyser", layout="wide")
 
-# --- REUSED LOGIC FROM YOUR SCRIPT ---
+# --- LOGIC FUNCTIONS ---
 def parse_message(msg: str) -> dict:
     result = {"emp_name": None, "emp_id": None, "card_no": None, "direction": None}
     m = re.search(r"(?:Admitted|Rejected)\s+'(.+?),\s*\^(\d{6,8})\^", msg)
@@ -28,20 +28,16 @@ def load_data(uploaded_file) -> pd.DataFrame:
     df["timestamp"] = pd.to_datetime(df["Server Date/Time"], format="%d-%m-%y %H:%M", errors="coerce")
     df = df.dropna(subset=["timestamp"])
     df["date"] = df["timestamp"].dt.date
+    df["month"] = df["timestamp"].dt.month
+    df["year"] = df["timestamp"].dt.year
     parsed = df["Message Text"].apply(parse_message).apply(pd.Series)
     df = pd.concat([df.reset_index(drop=True), parsed], axis=1)
     df = df.dropna(subset=["emp_id", "direction"])
     return df.sort_values(["emp_id", "timestamp"]).reset_index(drop=True)
 
-def compute_sessions(df: pd.DataFrame, emp_id: str, query_date):
-    subset = df[(df["emp_id"] == emp_id) & (df["date"] == query_date)].copy()
-    if subset.empty:
-        return None, [], []
-    
-    emp_name = subset["emp_name"].iloc[0]
-    events = subset[["timestamp", "direction"]].values.tolist()
+def compute_sessions(events):
+    """Generic session calculator for any list of events"""
     sessions, warnings, i = [], [], 0
-
     while i < len(events):
         ts, direction = events[i]
         if direction == "IN":
@@ -49,17 +45,17 @@ def compute_sessions(df: pd.DataFrame, emp_id: str, query_date):
                 sessions.append({"Login": ts, "Logout": events[i+1][0], "Duration": events[i+1][0] - ts, "Note": ""})
                 i += 2
             else:
-                sessions.append({"Login": ts, "Logout": None, "Duration": None, "Note": "⚠ No logout recorded"})
+                sessions.append({"Login": ts, "Logout": None, "Duration": None, "Note": "⚠ No logout"})
                 warnings.append(f"IN at {ts.strftime('%H:%M')} has no matching OUT")
                 i += 1
         else:
-            sessions.append({"Login": None, "Logout": ts, "Duration": None, "Note": "⚠ No login recorded"})
+            sessions.append({"Login": None, "Logout": ts, "Duration": None, "Note": "⚠ No login"})
             warnings.append(f"OUT at {ts.strftime('%H:%M')} has no preceding IN")
             i += 1
-    return emp_name, sessions, warnings
+    return sessions, warnings
 
 def fmt_dur(td):
-    if td is None or pd.isna(td): return "—"
+    if td is None or pd.isna(td) or td == pd.Timedelta(0): return "0h 00m"
     total = int(td.total_seconds())
     h, m = divmod(total // 60, 60)
     return f"{h}h {m:02d}m"
@@ -87,35 +83,56 @@ if uploaded_file and search_val:
             emp_id = df[mask]["emp_id"].iloc[0]
 
     if emp_id:
-        name, sessions, warnings = compute_sessions(df, emp_id, query_date)
+        emp_data = df[df["emp_id"] == emp_id]
         
-        if name:
+        if not emp_data.empty:
+            name = emp_data["emp_name"].iloc[0]
             st.subheader(f"Results for: {name} (ID: {emp_id})")
-            st.info(f"Date: {query_date.strftime('%d %b %Y')}")
             
-            # Create Table
-            display_data = []
-            total_td = pd.Timedelta(0)
-            for s in sessions:
-                display_data.append({
-                    "Login": s["Login"].strftime("%H:%M") if s["Login"] else "—",
-                    "Logout": s["Logout"].strftime("%H:%M") if s["Logout"] else "—",
-                    "Duration": fmt_dur(s["Duration"]),
-                    "Note": s["Note"]
-                })
-                if s["Duration"]: total_td += s["Duration"]
+            # --- 1. MONTHLY CALCULATIONS ---
+            current_month = query_date.month
+            current_year = query_date.year
+            month_mask = (emp_data["month"] == current_month) & (emp_data["year"] == current_year)
+            month_subset = emp_data[month_mask]
             
-            st.table(pd.DataFrame(display_data))
+            month_events = month_subset[["timestamp", "direction"]].values.tolist()
+            month_sessions, _ = compute_sessions(month_events)
+            total_month_td = sum([s["Duration"] for s in month_sessions if s["Duration"]], pd.Timedelta(0))
             
-            # Total Box
-            st.metric("Total Hours Worked", fmt_dur(total_td))
+            # --- 2. DAILY CALCULATIONS ---
+            day_subset = emp_data[emp_data["date"] == query_date]
+            day_events = day_subset[["timestamp", "direction"]].values.tolist()
+            day_sessions, day_warnings = compute_sessions(day_events)
+            total_day_td = sum([s["Duration"] for s in day_sessions if s["Duration"]], pd.Timedelta(0))
+
+            # --- DISPLAY METRICS ---
+            col1, col2 = st.columns(2)
+            with col1:
+                st.metric(f"Hours on {query_date.strftime('%d %b')}", fmt_dur(total_day_td))
+            with col2:
+                st.metric(f"Total for {query_date.strftime('%B %Y')}", fmt_dur(total_month_td))
+
+            # --- DAILY TABLE ---
+            st.write(f"#### Log Details for {query_date.strftime('%d %b %Y')}")
+            if day_sessions:
+                display_data = []
+                for s in day_sessions:
+                    display_data.append({
+                        "Login": s["Login"].strftime("%H:%M") if s["Login"] else "—",
+                        "Logout": s["Logout"].strftime("%H:%M") if s["Logout"] else "—",
+                        "Duration": fmt_dur(s["Duration"]),
+                        "Note": s["Note"]
+                    })
+                st.table(pd.DataFrame(display_data))
+            else:
+                st.warning("No records found for the specific day selected.")
             
-            if warnings:
-                with st.expander("⚠ View Warnings"):
-                    for w in warnings:
+            if day_warnings:
+                with st.expander("⚠ View Day Warnings"):
+                    for w in day_warnings:
                         st.warning(w)
         else:
-            st.error("No records found for this person on the selected date.")
+            st.error("Employee not found in the file.")
     else:
         st.error("Employee not found in the file.")
 else:
