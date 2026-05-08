@@ -3,128 +3,145 @@ import pandas as pd
 import re
 from datetime import datetime
 
-st.set_page_config(page_title="Office Hours Master Analyser", layout="wide")
+# Page Config
+st.set_page_config(page_title="Office Hours Analyser", layout="wide")
 
 # ─────────────────────────────────────────────────────────────
-# 1. ROBUST PARSER (Handles "Unknown" formats gracefully)
+# 1. ROBUST DATA PARSER
 # ─────────────────────────────────────────────────────────────
 def parse_message(msg: str) -> dict:
     result = {"emp_name": "Unknown", "emp_id": None, "direction": None}
     if not isinstance(msg, str): return result
 
-    # Primary Pattern: 'Name, ^ID^'
-    m1 = re.search(r"'(.+?),\s*\^(\d+)\^", msg)
-    if m1:
-        result["emp_name"], result["emp_id"] = m1.group(1).strip(), m1.group(2)
+    # Pattern: 'Name, ^ID^'
+    m = re.search(r"'(.+?),\s*\^(\d+)\^", msg)
+    if m:
+        result["emp_name"], result["emp_id"] = m.group(1).strip(), m.group(2)
     
-    # Direction Search: Case-insensitive (IN) or (OUT)
+    # Direction: (IN) or (OUT)
     if "(IN)" in msg.upper(): result["direction"] = "IN"
     elif "(OUT)" in msg.upper(): result["direction"] = "OUT"
-            
     return result
 
-# ─────────────────────────────────────────────────────────────
-# 2. ROBUST DATA LOADING ENGINE
-# ─────────────────────────────────────────────────────────────
 def load_data(uploaded_file):
-    # Layer 1: Read and clean headers
     df = pd.read_excel(uploaded_file, dtype=str)
     df.columns = df.columns.str.strip()
     
-    # Layer 2: Filter for valid activity
+    # Basic filters and date parsing
     df = df[df["Message"].str.contains("admitted", case=False, na=False)].copy()
-    
-    # Layer 3: Defensive Date Parsing
     df["timestamp"] = pd.to_datetime(df["Server Date/Time"], errors="coerce")
     df = df.dropna(subset=["timestamp"])
     df["Month"] = df["timestamp"].dt.strftime('%B %Y')
     df["date"] = df["timestamp"].dt.date
     
-    # Layer 4: Parse Message Text and ensure column existence
+    # Parse text into columns
     parsed_df = df["Message Text"].apply(parse_message).apply(pd.Series)
     df = pd.concat([df.reset_index(drop=True), parsed_df], axis=1)
     
-    # Ensure critical columns always exist to prevent KeyError
+    # Ensure critical columns exist to prevent KeyError crashes
     for col in ["emp_id", "direction", "emp_name"]:
         if col not in df.columns: df[col] = None
 
     return df.dropna(subset=["emp_id", "direction"]).sort_values(["emp_id", "timestamp"])
 
-# ─────────────────────────────────────────────────────────────
-# 3. STATS ENGINE
-# ─────────────────────────────────────────────────────────────
-def compute_all_stats(df):
-    results = []
-    # Groups by unique person + month combination
-    for (emp_id, month, name), group in df.groupby(["emp_id", "Month", "emp_name"]):
-        events = group[["timestamp", "direction"]].values.tolist()
-        total_td = pd.Timedelta(0)
-        i = 0
-        while i < len(events) - 1:
-            if events[i][1] == "IN" and events[i+1][1] == "OUT":
-                total_td += (events[i+1][0] - events[i][0])
-                i += 2
-            else: i += 1
-        results.append({"Employee ID": emp_id, "Name": name, "Month": month, "Total Duration": total_td})
-    return pd.DataFrame(results)
-
 def fmt_dur(td):
-    if pd.isna(td): return "0h 00m"
+    if pd.isna(td) or td.total_seconds() < 0: return "0h 00m"
     total = int(td.total_seconds())
     h, m = divmod(total // 60, 60)
     return f"{h}h {m:02d}m"
 
 # ─────────────────────────────────────────────────────────────
-# 4. SEARCHABLE INTERFACE
+# 2. APPLICATION INTERFACE
 # ─────────────────────────────────────────────────────────────
 st.title("🕒 Office Hours Master Analyser")
 
-uploaded_file = st.file_uploader("Upload Company Log (.xlsx)", type="xlsx")
+# STEP 1: Upload File
+uploaded_file = st.file_uploader("1. Upload Company Log (.xlsx)", type="xlsx")
 
 if uploaded_file:
-    # 1. Load data with robust patches
+    # Load and clean data immediately after upload
     full_df = load_data(uploaded_file)
     
-    # 2. Display Global Summary
-    st.header("📋 Global Performance Summary")
-    summary_df = compute_all_stats(full_df)
-    
-    if not summary_df.empty:
-        display_summary = summary_df.copy()
-        display_summary["Work Hours"] = display_summary["Total Duration"].apply(fmt_dur)
-        st.dataframe(display_summary[["Month", "Employee ID", "Name", "Work Hours"]], use_container_width=True, hide_index=True)
-    
-    st.divider()
+    # STEP 2: Input Selection (Sidebar)
+    with st.sidebar:
+        st.header("Search & Filter")
+        
+        # Create a list of all employees for the dropdown
+        employee_list = full_df[['emp_id', 'emp_name']].drop_duplicates()
+        employee_options = ["--- Select Employee ---"] + employee_list.apply(
+            lambda x: f"{x['emp_name']} ({x['emp_id']})", axis=1
+        ).tolist()
+        
+        selected_emp = st.selectbox("2. Select Employee (Name or ID)", employee_options)
+        
+        # Manual Text Input as fallback
+        manual_search = st.text_input("Or type ID/Name manually:")
 
-    # 3. INPUT: Specific Search (ID or Name)
-    st.header("🔍 Employee Drill-Down")
-    search_input = st.text_input("Search for a specific ID or Name to see daily logs:")
-    
-    if search_input:
-        # Resolve search input to an ID
+    # STEP 3: Results Display
+    if selected_emp != "--- Select Employee ---" or manual_search:
+        # Resolve the ID from the selection or manual input
         target_id = None
-        if search_input.isdigit():
-            target_id = search_input
+        if manual_search:
+            if manual_search.isdigit(): target_id = manual_search
+            else:
+                match = full_df[full_df["emp_name"].str.contains(manual_search, case=False, na=False)]
+                if not match.empty: target_id = match["emp_id"].iloc[0]
         else:
-            match = full_df[full_df["emp_name"].str.contains(search_input, case=False, na=False)]
-            if not match.empty: target_id = match["emp_id"].iloc[0]
+            target_id = re.search(r"\((\d+)\)", selected_emp).group(1)
 
         if target_id:
             emp_data = full_df[full_df["emp_id"] == target_id]
-            st.success(f"Viewing detailed data for: **{emp_data['emp_name'].iloc[0]}**")
+            st.header(f"Results for: {emp_data['emp_name'].iloc[0]} ({target_id})")
+
+            # --- MONTHLY SUMMARY ---
+            st.subheader("📊 Monthly Totals")
+            monthly_durations = []
+            for month, group in emp_data.groupby("Month"):
+                total_td = pd.Timedelta(0)
+                events = group[["timestamp", "direction"]].values.tolist()
+                i = 0
+                while i < len(events) - 1:
+                    if events[i][1] == "IN" and events[i+1][1] == "OUT":
+                        total_td += (events[i+1][0] - events[i][0])
+                        i += 2
+                    else: i += 1
+                monthly_durations.append({"Month": month, "Duration": total_td})
             
-            # Show monthly cards for this person
-            person_summary = summary_df[summary_df["Employee ID"] == target_id]
-            m_cols = st.columns(len(person_summary))
-            for idx, (_, row) in enumerate(person_summary.iterrows()):
-                m_cols[idx].metric(row["Month"], fmt_dur(row["Total Duration"]))
+            m_cols = st.columns(len(monthly_durations))
+            for idx, row in enumerate(monthly_durations):
+                m_cols[idx].metric(row["Month"], fmt_dur(row["Duration"]))
 
-            # Select a date to view logs
-            target_date = st.selectbox("Pick a date to view clock-in/out times:", sorted(emp_data["date"].unique(), reverse=True))
+            st.divider()
+
+            # --- DAILY BREAKDOWN ---
+            st.subheader("📅 Daily Breakdown")
+            target_date = st.selectbox("Select Date", sorted(emp_data["date"].unique(), reverse=True))
             day_logs = emp_data[emp_data["date"] == target_date]
-            st.table(day_logs[["timestamp", "direction"]].assign(time=lambda x: x["timestamp"].dt.strftime("%H:%M"))[["time", "direction"]])
+            
+            # Formatting the daily table
+            display_day = day_logs[["timestamp", "direction"]].copy()
+            display_day["Time"] = display_day["timestamp"].dt.strftime("%H:%M")
+            st.table(display_day[["Time", "direction"]])
         else:
-            st.error("No employee found matching that name or ID.")
+            st.error("Employee not found.")
+    else:
+        # Show Global Summary by default if no one is searched
+        st.info("👈 Use the sidebar to search for a specific employee, or view the overall summary below.")
+        st.subheader("📋 Overall Office Summary (By Month)")
+        
+        # Simple global table
+        global_summary = []
+        for (eid, month, name), group in full_df.groupby(["emp_id", "Month", "emp_name"]):
+            total_td = pd.Timedelta(0)
+            events = group[["timestamp", "direction"]].values.tolist()
+            i = 0
+            while i < len(events) - 1:
+                if events[i][1] == "IN" and events[i+1][1] == "OUT":
+                    total_td += (events[i+1][0] - events[i][0])
+                    i += 2
+                else: i += 1
+            global_summary.append({"Month": month, "ID": eid, "Name": name, "Work Hours": fmt_dur(total_td)})
+        
+        st.dataframe(pd.DataFrame(global_summary), use_container_width=True, hide_index=True)
 else:
-    st.info("Please upload an Excel file to see the full office report.")
-
+    st.info("👋 Welcome! Please upload your access log file to begin.")
